@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>POS — Vente en Magasin</title>
+  <!-- Tailwind Play CDN (rapide pour dev) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* small custom styles to match modern POS look */
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.9), rgba(250,250,250,0.9));
+      border: 1px solid rgba(0,0,0,0.04);
+      box-shadow: 0 6px 18px rgba(12, 20, 40, 0.06);
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased">
+  <header class="bg-white border-b">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-4">
+        <div class="text-xl font-semibold text-slate-700">POS — Vente en Magasin</div>
+        <div class="text-sm text-slate-500">Module indépendant · Frontend Tailwind</div>
+      </div>
+      <div class="flex items-center gap-4">
+        <div class="text-sm text-slate-600">Serveur : <span id="api-url" class="font-medium">http://127.0.0.1:5001</span></div>
+        <button id="btn-refresh" class="px-3 py-2 bg-sky-600 text-white rounded-md text-sm hover:bg-sky-700">Actualiser</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <!-- Product area -->
+    <section class="lg:col-span-3">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold">Produits</h2>
+        <div class="text-sm text-slate-500">Sélectionnez et ajoutez au panier</div>
+      </div>
+
+      <div id="products" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+        <!-- cards injected here -->
+      </div>
+    </section>
+
+    <!-- Cart / Checkout area -->
+    <aside class="lg:col-span-1">
+      <div class="card p-4 rounded-lg">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold">Panier</h3>
+          <div class="text-xs text-slate-500" id="cart-status">—</div>
+        </div>
+
+        <div id="cart-items" class="space-y-3 min-h-[120px]">
+          <div class="text-sm text-slate-400">Le panier est vide</div>
+        </div>
+
+        <div class="border-t mt-4 pt-3 space-y-2">
+          <div class="flex justify-between">
+            <div class="text-sm text-slate-600">Sous-total</div>
+            <div id="subtotal" class="font-medium">0.00 DT</div>
+          </div>
+          <div class="flex justify-between">
+            <div class="text-sm text-slate-600">Taxes</div>
+            <div id="taxes" class="font-medium">0.00 DT</div>
+          </div>
+          <div class="flex justify-between">
+            <div class="text-sm text-slate-600">Total</div>
+            <div id="total" class="text-xl font-semibold">0.00 DT</div>
+          </div>
+        </div>
+
+        <div class="mt-4 grid grid-cols-1 gap-2">
+          <button id="btn-create-cart" class="w-full py-2 bg-green-600 text-white rounded-md">Créer panier</button>
+          <button id="btn-view-cart" class="w-full py-2 bg-white border text-slate-700 rounded-md">Voir panier</button>
+          <button id="btn-checkout" class="w-full py-2 bg-sky-600 text-white rounded-md">Paiement / Checkout</button>
+        </div>
+      </div>
+
+      <div class="mt-4 text-xs text-slate-500">
+        <p><strong>Notes :</strong></p>
+        <ul class="list-disc pl-5">
+          <li>Assure-toi que le backend est lancé (127.0.0.1:5001).</li>
+          <li>Active CORS sur le backend si tu charges ce fichier via file:// ou un serveur local.</li>
+        </ul>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Modals and overlays -->
+  <div id="modal-root"></div>
+
+  <script>
+    /* ===========================
+       Configuration / State
+       =========================== */
+    const API_BASE = 'http://127.0.0.1:5001';
+    // state
+    let state = {
+      cartId: null,
+      cartItems: [],
+      totals: { total_ht: 0, total_tax: 0, total_ttc: 0 },
+      articles: []
+    };
+
+    /* ===========================
+       Helpers
+       =========================== */
+    function formatDT(v) {
+      return parseFloat(v).toFixed(2) + ' DT';
+    }
+
+    function el(tag, cls = '', text = '') {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text) e.textContent = text;
+      return e;
+    }
+
+    function showToast(message, type = 'info') {
+      // simple toast
+      const t = el('div', 'fixed right-4 bottom-6 z-50 p-3 rounded shadow-lg text-white', message);
+      t.style.background = type === 'error' ? '#ef4444' : (type === 'success' ? '#10b981' : '#334155');
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 2500);
+    }
+
+    /* ===========================
+       API calls
+       =========================== */
+
+    async function apiFetch(path, options = {}) {
+      const url = API_BASE + path;
+      try {
+        const res = await fetch(url, options);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(res.status + ' — ' + text);
+        }
+        return await res.json();
+      } catch (err) {
+        console.error('API ERROR', err);
+        throw err;
+      }
+    }
+
+    async function loadArticles() {
+      try {
+        const data = await apiFetch('/articles');
+        state.articles = data.articles;
+        renderProducts();
+      } catch (err) {
+        showToast('Impossible de charger les articles (backend?)', 'error');
+      }
+    }
+
+    async function createCart() {
+      try {
+        const res = await apiFetch('/panier', { method: 'POST' });
+        state.cartId = res.cart_id;
+        state.cartItems = [];
+        updateCartUI();
+        showToast('Panier créé (id: ' + state.cartId + ')', 'success');
+      } catch (err) {
+        showToast('Erreur création panier', 'error');
+      }
+    }
+
+    async function addItemToCart(articleId, qty = 1) {
+      if (!state.cartId) {
+        showToast('Créez d’abord un panier', 'error');
+        return;
+      }
+      try {
+        await apiFetch(`/panier/${state.cartId}/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ article_id: articleId, qty: qty })
+        });
+        await refreshCart();
+        showToast('Ajouté au panier', 'success');
+      } catch (err) {
+        showToast('Ajout impossible: ' + err.message, 'error');
+      }
+    }
+
+    async function refreshCart() {
+      if (!state.cartId) return;
+      try {
+        const data = await apiFetch(`/panier/${state.cartId}`);
+        state.cartItems = data.items;
+        // compute totals locally too (server returns when invoiced)
+        computeTotals();
+        updateCartUI();
+      } catch (err) {
+        console.warn('refreshCart failed', err);
+      }
+    }
+
+    async function removeItemFromCart(articleId) {
+      if (!state.cartId) return;
+      try {
+        await apiFetch(`/panier/${state.cartId}/items/${articleId}`, { method: 'DELETE' });
+        await refreshCart();
+        showToast('Article retiré', 'success');
+      } catch (err) {
+        showToast('Impossible de retirer', 'error');
+      }
+    }
+
+    function computeTotals() {
+      let ht = 0, tax = 0;
+      state.cartItems.forEach(it => {
+        const net = (it.unit_price * it.qty) - (it.discount || 0);
+        const vat = it.vat || 0.19;
+        ht += net;
+        tax += net * vat;
+      });
+      state.totals = { total_ht: ht, total_tax: tax, total_ttc: ht + tax };
+    }
+
+    async function doCheckout(paymentMethod = 'card') {
+      if (!state.cartId) { showToast('Aucun panier ouvert', 'error'); return; }
+      try {
+        // open a simple payment modal to gather fake card number if needed
+        const payment_details = {};
+        if (paymentMethod === 'card') {
+          const card = prompt('Numéro de carte (pour simulation, chiffre finissant par 0 provoque un rejet):', '4242424242424242');
+          if (!card) { showToast('Paiement annulé', 'info'); return; }
+          payment_details.card_number = card;
+        }
+        const res = await apiFetch(`/panier/${state.cartId}/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ payment_method: paymentMethod, payment_details })
+        });
+        // show invoice page/modal
+        showInvoice(res.invoice_id);
+        // reset cartId to force new creation if desired
+        state.cartId = null;
+        state.cartItems = [];
+        computeTotals();
+        updateCartUI();
+        showToast('Paiement réussi', 'success');
+      } catch (err) {
+        showToast('Paiement échoué: ' + err.message, 'error');
+      }
+    }
+
+    async function showInvoice(invoiceId) {
+      try {
+        const data = await apiFetch(`/factures/${invoiceId}`);
+        const inv = data.invoice;
+        const items = data.items;
+        // open modal
+        openModal(renderInvoiceModal(inv, items));
+      } catch (err) {
+        showToast('Impossible de récupérer la facture', 'error');
+      }
+    }
+
+    /* ===========================
+       UI rendering
+       =========================== */
+
+    function renderProducts() {
+      const root = document.getElementById('products');
+      root.innerHTML = '';
+      state.articles.forEach(a => {
+        const card = el('div', 'card p-4 rounded-lg');
+        const title = el('div', 'font-semibold text-slate-700', a.name);
+        const sku = el('div', 'text-xs text-slate-400 mt-1', a.sku);
+        const price = el('div', 'mt-3 flex items-baseline justify-between');
+        const pLeft = el('div', 'text-xl font-bold text-slate-800', (parseFloat(a.price)).toFixed(2) + ' DT');
+        const pRight = el('div', 'text-sm text-slate-500', 'Stock: ' + a.stock);
+        price.appendChild(pLeft); price.appendChild(pRight);
+
+        const actions = el('div', 'mt-4 flex gap-2');
+        const qtyInput = el('input', 'w-20 px-2 py-1 border rounded', '');
+        qtyInput.type = 'number';
+        qtyInput.min = 1;
+        qtyInput.value = 1;
+
+        const addBtn = el('button', 'ml-auto px-3 py-2 bg-emerald-600 text-white rounded-md text-sm', 'Ajouter');
+        addBtn.onclick = () => addItemToCart(a.id, parseInt(qtyInput.value || 1));
+
+        actions.appendChild(qtyInput);
+        actions.appendChild(addBtn);
+
+        card.appendChild(title);
+        card.appendChild(sku);
+        card.appendChild(price);
+        card.appendChild(actions);
+
+        root.appendChild(card);
+      });
+    }
+
+    function updateCartUI() {
+      const root = document.getElementById('cart-items');
+      root.innerHTML = '';
+      if (!state.cartId) {
+        document.getElementById('cart-status').textContent = 'Aucun panier';
+      } else {
+        document.getElementById('cart-status').textContent = 'ID: ' + state.cartId;
+      }
+      if (!state.cartItems || state.cartItems.length === 0) {
+        root.innerHTML = '<div class="text-sm text-slate-400">Le panier est vide</div>';
+      } else {
+        state.cartItems.forEach(it => {
+          const row = el('div', 'flex items-center justify-between');
+          const left = el('div', 'text-sm');
+          left.innerHTML = `<div class="font-medium">${it.name}</div><div class="text-xs text-slate-500">x${it.qty} • ${it.sku}</div>`;
+          const right = el('div', 'text-right');
+          right.innerHTML = `<div class="font-medium">${(it.unit_price*it.qty - (it.discount||0)).toFixed(2)} DT</div>
+                              <div class="text-xs mt-1"><button class="text-emerald-600 text-xs" onclick="removeItemFromCart(${it.article_id})">Retirer</button></div>`;
+          row.appendChild(left); row.appendChild(right);
+          root.appendChild(row);
+        });
+      }
+      computeTotals();
+      document.getElementById('subtotal').textContent = formatDT(state.totals.total_ht);
+      document.getElementById('taxes').textContent = formatDT(state.totals.total_tax);
+      document.getElementById('total').textContent = formatDT(state.totals.total_ttc);
+    }
+
+    /* ===========================
+       Modal helpers
+       =========================== */
+    function openModal(contentEl) {
+      const root = document.getElementById('modal-root');
+      root.innerHTML = '';
+      const overlay = el('div', 'fixed inset-0 bg-black/40 flex items-center justify-center z-50');
+      const box = el('div', 'w-full max-w-2xl p-6 bg-white rounded-lg shadow-lg');
+      const closeBtn = el('button', 'absolute right-6 top-6 text-slate-500', '✕');
+      closeBtn.onclick = () => root.innerHTML = '';
+      box.appendChild(closeBtn);
+      box.appendChild(contentEl);
+      overlay.appendChild(box);
+      root.appendChild(overlay);
+    }
+
+    function renderInvoiceModal(inv, items) {
+      const wrap = el('div', '');
+      const h = el('h3', 'text-lg font-semibold mb-4', 'Facture #' + inv.id);
+      wrap.appendChild(h);
+      const meta = el('div', 'text-sm text-slate-500 mb-4', `Date: ${new Date(inv.created_at).toLocaleString()}`);
+      wrap.appendChild(meta);
+
+      const table = el('div', 'space-y-2 mb-4');
+      items.forEach(it => {
+        const row = el('div', 'flex justify-between text-sm');
+        row.innerHTML = `<div>${it.name} <span class="text-xs text-slate-400">x${it.qty}</span></div><div>${(it.unit_price*it.qty - (it.discount||0)).toFixed(2)} DT</div>`;
+        table.appendChild(row);
+      });
+      wrap.appendChild(table);
+
+      const totalsBox = el('div', 'border-t pt-3 space-y-2');
+      totalsBox.innerHTML = `<div class="flex justify-between"><div>Sous-total</div><div class="font-medium">${inv.total_ht.toFixed(2)} DT</div></div>
+        <div class="flex justify-between"><div>Taxes</div><div class="font-medium">${inv.total_tax.toFixed(2)} DT</div></div>
+        <div class="flex justify-between"><div class="text-lg font-semibold">Total</div><div class="text-lg font-semibold">${inv.total_ttc.toFixed(2)} DT</div></div>`;
+      wrap.appendChild(totalsBox);
+
+      const actions = el('div', 'mt-4 flex gap-2 justify-end');
+      const close = el('button', 'px-3 py-2 bg-slate-200 rounded', 'Fermer');
+      close.onclick = () => document.getElementById('modal-root').innerHTML = '';
+      actions.appendChild(close);
+      wrap.appendChild(actions);
+      return wrap;
+    }
+
+    /* ===========================
+       Event bindings
+       =========================== */
+    document.getElementById('btn-refresh').addEventListener('click', loadArticles);
+    document.getElementById('btn-create-cart').addEventListener('click', createCart);
+    document.getElementById('btn-view-cart').addEventListener('click', async () => {
+      if (!state.cartId) { showToast('Aucun panier. Cliquez "Créer panier".', 'info'); return; }
+      await refreshCart();
+      openModal(renderCartModal());
+    });
+    document.getElementById('btn-checkout').addEventListener('click', async () => {
+      if (!state.cartId) { showToast('Créez un panier d’abord', 'info'); return; }
+      await refreshCart();
+      openModal(renderCheckoutModal());
+    });
+
+    function renderCartModal() {
+      const wrap = el('div', '');
+      const h = el('h3', 'text-lg font-semibold mb-4', 'Panier ID: ' + state.cartId);
+      wrap.appendChild(h);
+      if (!state.cartItems.length) {
+        wrap.appendChild(el('div', 'text-sm text-slate-500', 'Le panier est vide'));
+      } else {
+        state.cartItems.forEach(it => {
+          const row = el('div', 'flex justify-between mb-2');
+          row.innerHTML = `<div>${it.name} <small class="text-slate-400">x${it.qty}</small></div><div>${(it.unit_price*it.qty - (it.discount||0)).toFixed(2)} DT</div>`;
+          wrap.appendChild(row);
+        });
+      }
+      const totalRow = el('div', 'border-t pt-3 flex justify-between font-semibold', '');
+      totalRow.innerHTML = `<div>Total</div><div>${formatDT(state.totals.total_ttc)}</div>`;
+      wrap.appendChild(totalRow);
+      const actions = el('div', 'mt-4 flex gap-2 justify-end');
+      const close = el('button', 'px-3 py-2 bg-slate-200 rounded', 'Fermer');
+      close.onclick = () => document.getElementById('modal-root').innerHTML = '';
+      actions.appendChild(close);
+      wrap.appendChild(actions);
+      return wrap;
+    }
+
+    function renderCheckoutModal() {
+      const wrap = el('div', '');
+      wrap.appendChild(el('h3', 'text-lg font-semibold mb-4', 'Checkout'));
+      const summary = el('div', 'mb-3', `Total: ${formatDT(state.totals.total_ttc)}`);
+      wrap.appendChild(summary);
+      const p = el('div', 'space-y-2');
+      p.innerHTML = `
+        <label class="block text-sm">Mode de paiement</label>
+      `;
+      // buttons for payment modes
+      const btns = el('div', 'flex gap-2 mt-2');
+      const card = el('button', 'px-3 py-2 bg-sky-600 text-white rounded', 'Carte / Mobile');
+      card.onclick = () => { document.getElementById('modal-root').innerHTML = ''; doCheckout('card'); };
+      const cash = el('button', 'px-3 py-2 bg-emerald-600 text-white rounded', 'Espèces');
+      cash.onclick = () => { document.getElementById('modal-root').innerHTML = ''; doCheckout('cash'); };
+      const cheque = el('button', 'px-3 py-2 bg-yellow-500 text-white rounded', 'Chèque');
+      cheque.onclick = () => { document.getElementById('modal-root').innerHTML = ''; doCheckout('cheque'); };
+      btns.appendChild(card); btns.appendChild(cash); btns.appendChild(cheque);
+      wrap.appendChild(btns);
+      const cancel = el('div', 'mt-4 text-sm text-slate-500', 'Annuler pour revenir au panier');
+      wrap.appendChild(cancel);
+      return wrap;
+    }
+
+    /* ===========================
+       Start
+       =========================== */
+    (function init() {
+      document.getElementById('api-url').textContent = API_BASE;
+      loadArticles();
+      updateCartUI();
+    })();
+  </script>
+</body>
+</html>

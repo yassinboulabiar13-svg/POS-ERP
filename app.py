@@ -1,391 +1,354 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Dec  5 11:12:24 2025
-
-@author: Acer
-"""
-
-"""
-payments-backend/app.py
-
-Backend pour "Paiements & Encaissements" (Processus 4).
-- SQLite via SQLAlchemy
-- Endpoints: initier, authoriser (simulé), confirmer, receipts, list payments, ERP sync
-- DB file: pos_payments.db
-- Business rules: manager approval threshold, simple card/mobile validation, idempotence via client_payment_id
-"""
-
-import os
-import threading
-import time
-from datetime import datetime, timezone
+# app.py - Vente en Magasin (Flask + SQLAlchemy)
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from flask import Flask, request, jsonify, abort
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func
+import os
+import random
+import json
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "pos_payments.db")
-MANAGER_APPROVAL_THRESHOLD = float(os.environ.get("MANAGER_APPROVAL_THRESHOLD", "1000.0"))  # ex: 1000 DT
-ERP_RETRY_LIMIT = int(os.environ.get("ERP_RETRY_LIMIT", "3"))
+# Config
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///pos_vente.db')
+TAX_RATE = Decimal(os.getenv('TAX_RATE', '0.19'))  # 19% by default
+REMISE_MANAGER_THRESHOLD_PERCENT = Decimal(os.getenv('REMISE_MANAGER_THRESHOLD_PERCENT', '0.10'))  # 10%
+REMISE_MANAGER_THRESHOLD_AMOUNT = Decimal(os.getenv('REMISE_MANAGER_THRESHOLD_AMOUNT', '50.0'))
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+from flask_cors import CORS
+CORS(app)
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
 db = SQLAlchemy(app)
 
+# ---------- Models ----------
+class Setting(db.Model):
+    __tablename__ = 'settings'
+    key = db.Column(db.String(100), primary_key=True)
+    value = db.Column(db.String(200), nullable=False)
 
-# -----------------------
-# Models
-# -----------------------
-class Payment(db.Model):
-    __tablename__ = "payments"
+class Article(db.Model):
+    __tablename__ = 'articles'
     id = db.Column(db.Integer, primary_key=True)
-    client_payment_id = db.Column(db.String(128), unique=True, nullable=False)  # id fourni côté client pour idempotence
-    amount = db.Column(db.Float, nullable=False)
-    currency = db.Column(db.String(8), nullable=False, default="TND")
-    mode = db.Column(db.String(32), nullable=False)  # cash, card, mobile, cheque, voucher
-    status = db.Column(db.String(32), nullable=False, default="initiated")  # initiated, authorized, confirmed, failed
-    detail = db.Column(db.String(512), nullable=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
-    updated_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    manager_approved = db.Column(db.Integer, nullable=False, default=0)  # 1 if manager approval granted
-    erp_synced = db.Column(db.Integer, nullable=False, default=0)  # 1 if synced to ERP
-    erp_retry = db.Column(db.Integer, nullable=False, default=0)
+    sku = db.Column(db.String(80), unique=True, nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    price = db.Column(db.Numeric(12,2), nullable=False)
+    stock = db.Column(db.Integer, nullable=False, default=0)
+    reserved = db.Column(db.Integer, nullable=False, default=0)
+    vat = db.Column(db.Numeric(6,4), nullable=False, default=TAX_RATE)
 
-
-class PaymentAttempt(db.Model):
-    __tablename__ = "payment_attempts"
+class Cart(db.Model):
+    __tablename__ = 'carts'
     id = db.Column(db.Integer, primary_key=True)
-    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), nullable=False)
-    provider_response = db.Column(db.String(512), nullable=True)
-    success = db.Column(db.Integer, nullable=False, default=0)
-    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
-    payment = db.relationship("Payment", backref="attempts")
+    status = db.Column(db.String(30), nullable=False, default='OPEN')  # OPEN, CHECKOUT_PENDING, PAID, CANCELLED
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-
-class Receipt(db.Model):
-    __tablename__ = "receipts"
+class CartItem(db.Model):
+    __tablename__ = 'cart_items'
     id = db.Column(db.Integer, primary_key=True)
-    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), nullable=False)
-    receipt_number = db.Column(db.String(64), nullable=False, unique=True)
-    content = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
-    payment = db.relationship("Payment", backref="receipt")
+    cart_id = db.Column(db.Integer, db.ForeignKey('carts.id'), nullable=False)
+    article_id = db.Column(db.Integer, db.ForeignKey('articles.id'), nullable=False)
+    qty = db.Column(db.Integer, nullable=False, default=1)
+    unit_price = db.Column(db.Numeric(12,2), nullable=False)
+    discount = db.Column(db.Numeric(12,2), nullable=False, default=0.0)
+    article = db.relationship('Article')
 
-
-class ERPQueue(db.Model):
-    __tablename__ = "erp_queue"
+class Invoice(db.Model):
+    __tablename__ = 'invoices'
     id = db.Column(db.Integer, primary_key=True)
-    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), nullable=False)
-    attempts = db.Column(db.Integer, nullable=False, default=0)
-    next_try_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
-    payment = db.relationship("Payment", backref="erp_queue")
+    cart_id = db.Column(db.Integer, db.ForeignKey('carts.id'), nullable=False)
+    total_ht = db.Column(db.Numeric(12,2), nullable=False)
+    total_tax = db.Column(db.Numeric(12,2), nullable=False)
+    total_ttc = db.Column(db.Numeric(12,2), nullable=False)
+    payment_method = db.Column(db.String(50))
+    payment_status = db.Column(db.String(30), default='PENDING')  # PENDING, AUTHORIZED, FAILED
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class AuditLog(db.Model):
+    __tablename__ = 'audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    event = db.Column(db.String(200), nullable=False)
+    payload = db.Column(db.Text)
+    actor = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# -----------------------
-# Helpers
-# -----------------------
-def now_utc():
-    return datetime.now(timezone.utc)
+# ---------- Helpers ----------
+def decimal(v):
+    return Decimal(v).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
-
-def generate_receipt_number(payment: Payment):
-    ts = int(payment.created_at.timestamp())
-    return f"RCPT-{payment.id}-{ts}"
-
-
-def simple_card_check(card_info: dict, amount: float):
-    """
-    Simulate card/mobile authorization.
-    Business rules (simple simulation):
-     - card_info must contain 'number' (string of digits), 'expiry' (MM/YY), 'cvv' (3 digits)
-     - simulated acceptance: if last digit of card number is even -> accept; odd -> refuse
-     - if amount > MANAGER_APPROVAL_THRESHOLD and manager_approved is not set -> require approval (handled outside)
-    """
-    number = card_info.get("number", "")
-    cvv = str(card_info.get("cvv", ""))
-    expiry = card_info.get("expiry", "")
-    if not number.isdigit() or len(number) < 12 or len(number) > 19:
-        return False, "invalid_card_number"
-    if not cvv.isdigit() or not (3 <= len(cvv) <= 4):
-        return False, "invalid_cvv"
-    if not expiry or "/" not in expiry:
-        return False, "invalid_expiry"
-    # simple deterministic decision: last digit even => accepted
-    try:
-        last = int(number[-1])
-        if last % 2 == 0:
-            return True, "authorized"
-        else:
-            return False, "bank_decline"
-    except Exception:
-        return False, "processing_error"
-
-
-# -----------------------
-# Init DB
-# -----------------------
-with app.app_context():
-    db.create_all()
-
-
-# -----------------------
-# Endpoints
-# -----------------------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "time": now_utc().isoformat()}), 200
-
-
-@app.route("/payments/initiate", methods=["POST"])
-def initiate_payment():
-    """
-    Initiate a payment request (idempotent via client_payment_id)
-    Body JSON:
-    {
-        "client_payment_id": "cart-123-pay-1",
-        "amount": 120.0,
-        "currency": "TND",
-        "mode": "card"|"mobile"|"cash"|"cheque"|"voucher",
-        "metadata": {...},   # optional, e.g. card info for immediate authorization
-        "manager_approved": 0|1 (optional)
+def row_article(a: Article):
+    return {
+        "id": a.id,
+        "sku": a.sku,
+        "name": a.name,
+        "price": float(a.price),
+        "stock": a.stock,
+        "reserved": a.reserved,
+        "vat": float(a.vat)
     }
-    """
-    data = request.get_json() or {}
-    client_payment_id = data.get("client_payment_id")
-    amount = float(data.get("amount", 0))
-    mode = data.get("mode")
-    currency = data.get("currency", "TND")
-    manager_approved = int(data.get("manager_approved", 0))
 
-    if not client_payment_id or amount <= 0 or not mode:
-        return jsonify({"error": "client_payment_id, amount>0 and mode required"}), 400
-
-    # idempotence: return existing if present
-    existing = Payment.query.filter_by(client_payment_id=client_payment_id).first()
-    if existing:
-        return jsonify({"result": "exists", "payment_id": existing.id, "status": existing.status}), 200
-
-    # create payment
-    p = Payment(client_payment_id=client_payment_id, amount=amount, currency=currency, mode=mode,
-                status="initiated", manager_approved=1 if manager_approved else 0, created_at=now_utc())
-    db.session.add(p)
+def log_event(event, payload=None, actor=None):
+    db.session.add(AuditLog(event=event, payload=json.dumps(payload, default=str) if payload else None, actor=actor))
     db.session.commit()
-    return jsonify({"result": "initiated", "payment_id": p.id}), 201
 
+def get_setting(key, default=None):
+    s = Setting.query.get(key)
+    return s.value if s else default
 
-@app.route("/payments/authorize/<int:payment_id>", methods=["POST"])
-def authorize_payment(payment_id):
-    """
-    Authorize a payment (for electronic modes). Simulates call to payment provider.
-    Body JSON:
-      - for card/mobile: { "card": {"number":"...","expiry":"MM/YY","cvv":"..." } }
-    Rules:
-      - If amount > MANAGER_APPROVAL_THRESHOLD and manager_approved=0 => require manager approval
-      - Simulated acceptance logic in simple_card_check()
-    """
-    data = request.get_json() or {}
-    p = Payment.query.get_or_404(payment_id)
+# ---------- Init / Seed ----------
+def seed_defaults():
+    # settings
+    Setting.query.filter_by(key='TAX_RATE').delete()
+    db.session.merge(Setting(key='TAX_RATE', value=str(TAX_RATE)))
+    db.session.merge(Setting(key='REMISE_MANAGER_THRESHOLD_PERCENT', value=str(REMISE_MANAGER_THRESHOLD_PERCENT)))
+    db.session.merge(Setting(key='REMISE_MANAGER_THRESHOLD_AMOUNT', value=str(REMISE_MANAGER_THRESHOLD_AMOUNT)))
+    # sample articles
+    if Article.query.count() == 0:
+        sample = [
+            {"sku":"SKU-001","name":"Chemise Bleu","price":Decimal('70.00'),"stock":10},
+            {"sku":"SKU-002","name":"Jeans Slim","price":Decimal('120.00'),"stock":5},
+            {"sku":"SKU-003","name":"Chaussures Sport","price":Decimal('200.00'),"stock":4},
+            {"sku":"SKU-004","name":"Ceinture Cuir","price":Decimal('35.00'),"stock":15},
+        ]
+        for s in sample:
+            db.session.add(Article(sku=s['sku'], name=s['name'], price=s['price'], stock=s['stock'], reserved=0, vat=TAX_RATE))
+    db.session.commit()
 
-    if p.mode not in ("card", "mobile"):
-        return jsonify({"error": "authorization_not_required_for_mode", "mode": p.mode}), 400
+# ---------- Endpoints ----------
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status":"ok","time":datetime.utcnow().isoformat()+"Z"})
 
-    if p.status not in ("initiated", "failed"):
-        return jsonify({"error": "invalid_state_for_authorization", "status": p.status}), 400
+@app.route('/articles', methods=['GET'])
+def list_articles():
+    articles = Article.query.all()
+    return jsonify({"articles":[row_article(a) for a in articles]})
 
-    if p.amount > MANAGER_APPROVAL_THRESHOLD and p.manager_approved == 0:
-        return jsonify({"error": "manager_approval_required", "threshold": MANAGER_APPROVAL_THRESHOLD}), 403
+@app.route('/articles/<int:article_id>', methods=['GET'])
+def get_article(article_id):
+    a = Article.query.get(article_id)
+    if not a:
+        abort(404, "Article not found")
+    return jsonify(row_article(a))
 
-    card = data.get("card", {})
-    ok, reason = simple_card_check(card, p.amount)
-    attempt = PaymentAttempt(payment_id=p.id, provider_response=reason, success=1 if ok else 0, created_at=now_utc())
-    db.session.add(attempt)
-    if ok:
-        p.status = "authorized"
-        p.detail = f"provider:{reason}"
-        db.session.commit()
-        return jsonify({"result": "authorized", "payment_id": p.id}), 200
-    else:
-        p.status = "failed"
-        p.detail = f"provider:{reason}"
-        db.session.commit()
-        return jsonify({"result": "declined", "reason": reason}), 402
+@app.route('/panier', methods=['POST'])
+def create_cart():
+    c = Cart(status='OPEN')
+    db.session.add(c)
+    db.session.commit()
+    log_event("cart_created", {"cart_id": c.id}, actor=request.remote_addr)
+    return jsonify({"cart_id": c.id}), 201
 
-
-@app.route("/payments/confirm/<int:payment_id>", methods=["POST"])
-def confirm_payment(payment_id):
-    """
-    Confirm / capture the payment (finalize).
-    For cash/cheque/voucher, this records the payment directly.
-    For card/mobile, it requires status 'authorized' (unless mode supports capture on confirm).
-    Generates a receipt and enqueue ERP sync.
-    """
-    p = Payment.query.get_or_404(payment_id)
-    if p.status == "confirmed":
-        return jsonify({"result": "already_confirmed", "payment_id": p.id}), 200
-
-    if p.mode in ("card", "mobile"):
-        if p.status != "authorized":
-            return jsonify({"error": "not_authorized"}, 400)
-
-    # record confirmation
-    try:
-        p.status = "confirmed"
-        p.updated_at = now_utc()
-        db.session.add(p)
-        # create receipt
-        rn = generate_receipt_number(p)
-        content = f"Receipt {rn}\nPayment ID: {p.id}\nAmount: {p.amount} {p.currency}\nMode: {p.mode}\nDate: {p.updated_at.isoformat()}"
-        r = Receipt(payment_id=p.id, receipt_number=rn, content=content, created_at=now_utc())
-        db.session.add(r)
-        # enqueue ERP sync
-        q = ERPQueue(payment_id=p.id, attempts=0, created_at=now_utc())
-        db.session.add(q)
-        db.session.commit()
-        return jsonify({"result": "confirmed", "payment_id": p.id, "receipt_number": rn}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": "confirm_failed", "detail": str(e)}), 500
-
-
-@app.route("/payments/<int:payment_id>", methods=["GET"])
-def get_payment(payment_id):
-    p = Payment.query.get_or_404(payment_id)
-    receipt = None
-    if p.receipt:
-        receipt = {"receipt_number": p.receipt[0].receipt_number, "content": p.receipt[0].content}
-    return jsonify({
-        "id": p.id,
-        "client_payment_id": p.client_payment_id,
-        "amount": p.amount,
-        "currency": p.currency,
-        "mode": p.mode,
-        "status": p.status,
-        "detail": p.detail,
-        "manager_approved": bool(p.manager_approved),
-        "erp_synced": bool(p.erp_synced),
-        "receipt": receipt,
-        "created_at": p.created_at.isoformat(),
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None
-    })
-
-
-@app.route("/payments", methods=["GET"])
-def list_payments():
-    limit = int(request.args.get("limit", 100))
-    q = Payment.query.order_by(Payment.created_at.desc()).limit(limit).all()
-    out = []
-    for p in q:
-        out.append({
-            "id": p.id,
-            "client_payment_id": p.client_payment_id,
-            "amount": p.amount,
-            "mode": p.mode,
-            "status": p.status,
-            "erp_synced": bool(p.erp_synced),
-            "created_at": p.created_at.isoformat()
+@app.route('/panier/<int:cart_id>', methods=['GET'])
+def view_cart(cart_id):
+    c = Cart.query.get(cart_id)
+    if not c:
+        abort(404, "Cart not found")
+    items = CartItem.query.filter_by(cart_id=cart_id).all()
+    items_out = []
+    for it in items:
+        items_out.append({
+            "id": it.id,
+            "article_id": it.article_id,
+            "sku": it.article.sku,
+            "name": it.article.name,
+            "qty": it.qty,
+            "unit_price": float(it.unit_price),
+            "discount": float(it.discount)
         })
-    return jsonify(out)
+    return jsonify({"cart": {"id": c.id, "status": c.status}, "items": items_out})
 
+@app.route('/panier/<int:cart_id>/items', methods=['POST'])
+def add_item(cart_id):
+    data = request.get_json() or {}
+    article_id = data.get("article_id")
+    qty = int(data.get("qty", 1))
+    discount = Decimal(str(data.get("discount", "0.0")))
+    if not article_id or qty <= 0:
+        abort(400, "article_id and qty>0 required")
+    c = Cart.query.get(cart_id)
+    if not c or c.status != 'OPEN':
+        abort(400, "Cart not found or not open")
+    a = Article.query.get(article_id)
+    if not a:
+        abort(404, "Article not found")
+    available = a.stock - a.reserved
+    if qty > available:
+        abort(400, f"Stock insuffisant. disponible={available}")
+    # check existing item
+    existing = CartItem.query.filter_by(cart_id=cart_id, article_id=article_id).first()
+    if existing:
+        if existing.qty + qty > (a.stock - a.reserved):
+            abort(400, "Stock insuffisant pour la quantité totale demandée")
+        existing.qty = existing.qty + qty
+        existing.discount = existing.discount + discount
+    else:
+        ci = CartItem(cart_id=cart_id, article_id=article_id, qty=qty, unit_price=a.price, discount=discount)
+        db.session.add(ci)
+    # reserve
+    a.reserved = a.reserved + qty
+    db.session.commit()
+    log_event("item_added_to_cart", {"cart_id": cart_id, "article_id": article_id, "qty": qty}, actor=request.remote_addr)
+    return jsonify({"message":"item_added"}), 201
 
-@app.route("/receipts/<string:receipt_number>", methods=["GET"])
-def get_receipt(receipt_number):
-    r = Receipt.query.filter_by(receipt_number=receipt_number).first_or_404()
-    return jsonify({
-        "receipt_number": r.receipt_number,
-        "payment_id": r.payment_id,
-        "content": r.content,
-        "created_at": r.created_at.isoformat()
-    })
+@app.route('/panier/<int:cart_id>/items/<int:article_id>', methods=['DELETE'])
+def remove_item(cart_id, article_id):
+    c = Cart.query.get(cart_id)
+    if not c:
+        abort(404, "Cart not found")
+    it = CartItem.query.filter_by(cart_id=cart_id, article_id=article_id).first()
+    if not it:
+        abort(404, "Item not in cart")
+    # release reservation
+    a = Article.query.get(article_id)
+    if a:
+        a.reserved = max(0, a.reserved - it.qty)
+    db.session.delete(it)
+    db.session.commit()
+    log_event("item_removed", {"cart_id": cart_id, "article_id": article_id}, actor=request.remote_addr)
+    return jsonify({"message":"item_removed"})
 
+def compute_cart_totals(cart_id):
+    items = CartItem.query.filter_by(cart_id=cart_id).all()
+    total_ht = Decimal('0.00')
+    total_tax = Decimal('0.00')
+    for it in items:
+        line_net = (Decimal(it.unit_price) * it.qty) - Decimal(it.discount)
+        if line_net < 0:
+            line_net = Decimal('0.00')
+        vat = Decimal(it.article.vat) if it.article.vat is not None else TAX_RATE
+        tax = (line_net * vat)
+        total_ht += line_net
+        total_tax += tax
+    return {
+        "total_ht": decimal(total_ht),
+        "total_tax": decimal(total_tax),
+        "total_ttc": decimal(total_ht + total_tax)
+    }
 
-# -----------------------
-# Simulated ERP sync background worker
-# -----------------------
-def erp_sync_worker(interval=10):
-    """
-    Worker that tries to sync confirmed payments in ERPQueue.
-    Simulation: random acceptance or simple deterministic acceptance.
-    If sync succeeds -> mark payment.erp_synced = 1, delete queue entry.
-    If fails -> increment attempts and schedule retry; after ERP_RETRY_LIMIT -> leave for admin.
-    """
-    while True:
-        try:
-            with app.app_context():
-                pending = ERPQueue.query.order_by(ERPQueue.created_at).all()
-                for q in pending:
-                    p = q.payment
-                    # only sync confirmed payments
-                    if p.status != "confirmed":
-                        # remove orphan queue entries
-                        db.session.delete(q)
-                        db.session.commit()
-                        continue
+def simulate_payment_gateway(method, details, amount):
+    try:
+        amt = float(amount)
+    except:
+        amt = amount
+    if amt > 10000:
+        return {"authorized": False, "reason": "amount exceeds limit"}
+    card_num = (details or {}).get("card_number","")
+    if isinstance(card_num, str) and card_num.endswith("0"):
+        return {"authorized": False, "reason": "bank_decline"}
+    if random.random() < 0.95:
+        return {"authorized": True, "auth_code": "AUTH"+str(random.randint(100000,999999))}
+    else:
+        return {"authorized": False, "reason": "network_error"}
 
-                    # simulate sync success rule: accept if payment_id % 2 == 0 (deterministic)
-                    success = (p.id % 2 == 0)
-                    if success:
-                        p.erp_synced = 1
-                        p.erp_retry = q.attempts + 1
-                        db.session.delete(q)
-                        db.session.commit()
-                    else:
-                        q.attempts += 1
-                        q.next_try_at = now_utc()
-                        db.session.commit()
-                        if q.attempts >= ERP_RETRY_LIMIT:
-                            # stop retrying automatically, admin will handle
-                            print(f"ERP sync failed for payment {p.id} after {q.attempts} attempts")
-                # small pause
-        except Exception as e:
-            print("erp_sync_worker error:", e)
-        time.sleep(interval)
+@app.route('/panier/<int:cart_id>/checkout', methods=['POST'])
+def checkout(cart_id):
+    data = request.get_json() or {}
+    payment_method = data.get("payment_method")
+    payment_details = data.get("payment_details", {})
+    actor = data.get("actor", request.remote_addr)
+    if not payment_method:
+        abort(400, "payment_method required")
+    c = Cart.query.get(cart_id)
+    if not c:
+        abort(404, "Cart not found")
+    if c.status != 'OPEN':
+        abort(400, "Cart not open")
+    items = CartItem.query.filter_by(cart_id=cart_id).all()
+    if not items:
+        abort(400, "Cart empty")
+    # final stock check
+    for it in items:
+        a = it.article
+        if it.qty > a.stock:
+            abort(400, f"Stock insuffisant pour article {a.id}")
+    totals = compute_cart_totals(cart_id)
+    # simulate electronic payment
+    if payment_method in ('card','mobile'):
+        auth = simulate_payment_gateway(payment_method, payment_details, totals['total_ttc'])
+        if not auth['authorized']:
+            # release reservations
+            for it in items:
+                it.article.reserved = max(0, it.article.reserved - it.qty)
+            db.session.commit()
+            log_event('payment_failed', {'cart_id':cart_id, 'reason': auth.get('reason')}, actor=actor)
+            return jsonify({'payment': 'FAILED', 'reason': auth.get('reason')}), 402
+        payment_status = 'AUTHORIZED'
+    else:
+        payment_status = 'PENDING' if payment_method == 'cheque' else 'AUTHORIZED'
+    # create invoice
+    inv = Invoice(cart_id=cart_id, total_ht=totals['total_ht'], total_tax=totals['total_tax'], total_ttc=totals['total_ttc'], payment_method=payment_method, payment_status=payment_status)
+    db.session.add(inv)
+    # decrement stock and clear reserved
+    for it in items:
+        a = it.article
+        a.reserved = max(0, a.reserved - it.qty)
+        a.stock = max(0, a.stock - it.qty)
+    c.status = 'PAID' if payment_status == 'AUTHORIZED' else 'CHECKOUT_PENDING'
+    db.session.commit()
+    log_event('checkout_success', {'cart_id': cart_id, 'invoice_id': inv.id, 'totals': totals}, actor=actor)
+    # attempt to "sync" to ERP (simulated)
+    # in real system you'd push to ERP and handle nack/ack
+    return jsonify({'invoice_id': inv.id, 'totals': totals, 'payment_status': payment_status}), 201
 
-
-erp_thread = threading.Thread(target=erp_sync_worker, daemon=True)
-erp_thread.start()
-
-
-@app.route("/admin/erp_queue", methods=["GET"])
-def admin_list_erp_queue():
-    q = ERPQueue.query.all()
+@app.route('/factures', methods=['GET'])
+def list_invoices():
+    invs = Invoice.query.order_by(Invoice.created_at.desc()).all()
     out = []
-    for e in q:
-        out.append({"id": e.id, "payment_id": e.payment_id, "attempts": e.attempts, "created_at": e.created_at.isoformat()})
-    return jsonify(out)
+    for i in invs:
+        out.append({
+            "id": i.id,
+            "cart_id": i.cart_id,
+            "total_ht": float(i.total_ht),
+            "total_tax": float(i.total_tax),
+            "total_ttc": float(i.total_ttc),
+            "payment_method": i.payment_method,
+            "payment_status": i.payment_status,
+            "created_at": i.created_at.isoformat()
+        })
+    return jsonify({"invoices": out})
 
+@app.route('/factures/<int:invoice_id>', methods=['GET'])
+def get_invoice(invoice_id):
+    i = Invoice.query.get(invoice_id)
+    if not i:
+        abort(404, "Invoice not found")
+    items = CartItem.query.filter_by(cart_id=i.cart_id).all()
+    items_out = []
+    for it in items:
+        items_out.append({
+            "sku": it.article.sku,
+            "name": it.article.name,
+            "qty": it.qty,
+            "unit_price": float(it.unit_price),
+            "discount": float(it.discount)
+        })
+    return jsonify({"invoice": {
+        "id": i.id,
+        "cart_id": i.cart_id,
+        "total_ht": float(i.total_ht),
+        "total_tax": float(i.total_tax),
+        "total_ttc": float(i.total_ttc),
+        "payment_method": i.payment_method,
+        "payment_status": i.payment_status,
+        "created_at": i.created_at.isoformat()
+    }, "items": items_out})
 
-@app.route("/admin/force_sync/<int:payment_id>", methods=["POST"])
-def admin_force_sync(payment_id):
-    """
-    Admin endpoint to force sync a payment (simulate ERP manual sync).
-    """
-    p = Payment.query.get_or_404(payment_id)
-    # simulate immediate success
-    p.erp_synced = 1
-    p.erp_retry = p.erp_retry + 1
-    # remove any queue entries
-    ERPQueue.query.filter_by(payment_id=payment_id).delete()
-    db.session.commit()
-    return jsonify({"result": "forced_sync", "payment_id": payment_id}), 200
+# Admin reset (dev only)
+@app.route('/admin/reset-db', methods=['POST'])
+def reset_db():
+    if os.environ.get('ALLOW_DB_RESET','0') != '1':
+        abort(403, "DB reset disabled")
+    db.drop_all()
+    db.create_all()
+    seed_defaults()
+    return jsonify({"message":"db_reset"}), 200
 
-
-# -----------------------
-# Manager approval endpoint (for payments above threshold)
-# -----------------------
-@app.route("/admin/approve/<int:payment_id>", methods=["POST"])
-def admin_approve(payment_id):
-    p = Payment.query.get_or_404(payment_id)
-    p.manager_approved = 1
-    db.session.commit()
-    return jsonify({"result": "approved", "payment_id": payment_id}), 200
-
-
-# -----------------------
-# Run
-# -----------------------
-if __name__ == "__main__":
-    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=5003, debug=debug_mode)
+# ---------- Run ----------
+if __name__ == '__main__':
+    # ensure DB and seed inside application context to avoid context errors
+    with app.app_context():
+        db.create_all()
+        seed_defaults()
+    app.run(host='127.0.0.1', port=5001, debug=True)
