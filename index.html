@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Paiements & Encaissements POS</title>
+    <!-- Tailwind CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 font-sans">
+
+    <header class="bg-blue-600 text-white p-4 shadow-md">
+        <h1 class="text-2xl font-bold text-center">Module Paiements & Encaissements</h1>
+    </header>
+
+    <main class="container mx-auto p-4">
+
+        <!-- Section: Initier paiement -->
+        <section class="bg-white p-4 rounded shadow mb-6">
+            <h2 class="text-xl font-semibold mb-2">1️⃣ Initier un paiement</h2>
+            <form id="form-initiate" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input type="text" id="client_payment_id" placeholder="ID paiement client" class="p-2 border rounded">
+                <input type="number" id="amount" placeholder="Montant (TND)" class="p-2 border rounded">
+                <select id="mode" class="p-2 border rounded">
+                    <option value="cash">Espèces</option>
+                    <option value="card">Carte</option>
+                    <option value="mobile">Mobile</option>
+                    <option value="cheque">Chèque</option>
+                    <option value="voucher">Avoir / Bon</option>
+                </select>
+                <button type="submit" class="bg-blue-600 text-white rounded px-4 py-2 hover:bg-blue-700">Initier paiement</button>
+            </form>
+            <p id="initiate-result" class="mt-2 text-sm text-gray-700"></p>
+        </section>
+
+        <!-- Section: Autoriser paiement -->
+        <section class="bg-white p-4 rounded shadow mb-6">
+            <h2 class="text-xl font-semibold mb-2">2️⃣ Autoriser un paiement électronique</h2>
+            <form id="form-authorize" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input type="number" id="auth_payment_id" placeholder="ID du paiement" class="p-2 border rounded">
+                <input type="text" id="card_number" placeholder="Numéro carte" class="p-2 border rounded">
+                <input type="text" id="expiry" placeholder="MM/YY" class="p-2 border rounded">
+                <input type="text" id="cvv" placeholder="CVV" class="p-2 border rounded">
+                <button type="submit" class="bg-green-600 text-white rounded px-4 py-2 hover:bg-green-700">Autoriser</button>
+            </form>
+            <p id="authorize-result" class="mt-2 text-sm text-gray-700"></p>
+        </section>
+
+        <!-- Section: Confirmer paiement -->
+        <section class="bg-white p-4 rounded shadow mb-6">
+            <h2 class="text-xl font-semibold mb-2">3️⃣ Confirmer un paiement</h2>
+            <form id="form-confirm" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input type="number" id="confirm_payment_id" placeholder="ID du paiement" class="p-2 border rounded">
+                <button type="submit" class="bg-blue-600 text-white rounded px-4 py-2 hover:bg-blue-700">Confirmer paiement</button>
+            </form>
+            <p id="confirm-result" class="mt-2 text-sm text-gray-700"></p>
+        </section>
+
+    </main>
+
+    <script>
+        const BASE_URL = "http://127.0.0.1:5003";
+
+        // 1️⃣ Initier paiement
+        document.getElementById("form-initiate").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const client_payment_id = document.getElementById("client_payment_id").value;
+            const amount = parseFloat(document.getElementById("amount").value);
+            const mode = document.getElementById("mode").value;
+
+            const res = await fetch(`${BASE_URL}/initiate_payment`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ client_payment_id, amount, mode })
+            });
+            const data = await res.json();
+            document.getElementById("initiate-result").innerText = `Paiement créé avec ID: ${data.id}`;
+        });
+
+        // 2️⃣ Autoriser paiement électronique
+        document.getElementById("form-authorize").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const id = parseInt(document.getElementById("auth_payment_id").value);
+            const card_number = document.getElementById("card_number").value;
+            const expiry = document.getElementById("expiry").value;
+            const cvv = document.getElementById("cvv").value;
+
+            const res = await fetch(`${BASE_URL}/authorize_payment`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id, card_number, expiry, cvv })
+            });
+            const data = await res.json();
+            document.getElementById("authorize-result").innerText = data.status ? "Paiement autorisé" : "Autorisation refusée";
+        });
+
+        // 3️⃣ Confirmer paiement
+        document.getElementById("form-confirm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const id = parseInt(document.getElementById("confirm_payment_id").value);
+            const res = await fetch(`${BASE_URL}/confirm_payment`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id })
+            });
+            const data = await res.json();
+            document.getElementById("confirm-result").innerText = data.status ? 
+                `Paiement confirmé (ERP synchro: ${data.erp_synced})` : "Échec de confirmation";
+        });
+    </script>
+
+</body>
+</html>
